@@ -22,6 +22,8 @@ import shutil
 import sys
 import time
 
+import tensorflow as tf
+from torch.nn.functional import threshold, normalize
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -33,6 +35,7 @@ from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from config import get_config
 from dataloaders import utils
@@ -40,8 +43,12 @@ from dataloaders.dataset import (BaseDataSets, RandomGenerator,
                                  TwoStreamBatchSampler)
 from networks.net_factory import net_factory
 from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.RadImageNet_pretrained_models import get_compiled_RadImageNet_model
+from networks.attention_unet import Attention_UNet
 from utils import losses, metrics, ramps
 from val_2D import test_single_volume
+
+from SAM.segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
@@ -58,7 +65,7 @@ parser.add_argument('--deterministic', type=int,  default=1,
                     help='whether use deterministic training')
 parser.add_argument('--base_lr', type=float,  default=0.01,
                     help='segmentation network learning rate')
-parser.add_argument('--patch_size', type=list,  default=[224, 224],
+parser.add_argument('--patch_size', type=list,  default=[256, 256], # FIXME return to 224
                     help='patch size of network input')
 parser.add_argument('--seed', type=int,  default=1337, help='random seed')
 parser.add_argument('--num_classes', type=int,  default=4,
@@ -151,6 +158,53 @@ def update_ema_variables(model, ema_model, alpha, global_step):
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
+def show_anns(anns):
+    if len(anns) == 0:
+        return
+    sorted_anns = sorted(anns, key=(lambda x: x['area']), reverse=True)
+    ax = plt.gca()
+    ax.set_autoscale_on(False)
+    polygons = []
+    color = []
+    for ann in sorted_anns:
+        m = ann['segmentation']
+        img = np.ones((m.shape[0], m.shape[1], 3))
+        color_mask = np.random.random((1, 3)).tolist()[0]
+        for i in range(3):
+            img[:,:,i] = color_mask[i]
+        ax.imshow(np.dstack((img, m*0.35)))
+
+
+def find_bounding_box_from_tensor(tensor):
+    # Ensure tensor is a PyTorch tensor
+    tensor = tensor.long()
+
+    # Create masks for each class (1, 2, 3)
+    mask_1 = tensor == 1
+    mask_2 = tensor == 2
+    mask_3 = tensor == 3
+
+    # Combine all masks into a single mask
+    combined_mask = mask_1 | mask_2 | mask_3
+
+    # Find non-zero indices (where combined_mask is True)
+    nonzero_indices = torch.nonzero(combined_mask, as_tuple=False)
+
+    if nonzero_indices.numel() == 0:
+        # If no non-zero elements, return invalid bounding box
+        return None
+
+    # Extract x and y coordinates
+    x_coords = nonzero_indices[:, 1]
+    y_coords = nonzero_indices[:, 0]
+
+    # Find bounding box coordinates
+    min_x = x_coords.min().item()
+    max_x = x_coords.max().item()
+    min_y = y_coords.min().item()
+    max_y = y_coords.max().item()
+
+    return [[min_x, min_y], [max_x, max_y]]
 
 def train(args, snapshot_path):
     base_lr = args.base_lr
@@ -168,9 +222,12 @@ def train(args, snapshot_path):
         return model
 
     model1 = create_model()
-    model2 = ViT_seg(config, img_size=args.patch_size,
-                     num_classes=args.num_classes)# .cuda()
-    model2.load_from(config)
+    #model2 = Attention_UNet(n_classes=args.num_classes, in_channels=1)
+    model2 = sam_model_registry['vit_b'](checkpoint='pretrained_ckpt/sam_vit_b_01ec64.pth')
+    # model2 = get_compiled_RadImageNet_model('IRV2', args.patch_size[0], base_lr)
+    # model2 = ViT_seg(config, img_size=args.patch_size,
+    #                 num_classes=args.num_classes)# .cuda()
+    # model2.load_from(config)
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
@@ -202,6 +259,7 @@ def train(args, snapshot_path):
                            momentum=0.9, weight_decay=0.0001)
     optimizer2 = optim.SGD(model2.parameters(), lr=base_lr,
                            momentum=0.9, weight_decay=0.0001)
+
     ce_loss = CrossEntropyLoss()
     dice_loss = losses.DiceLoss(num_classes)
 
@@ -222,8 +280,44 @@ def train(args, snapshot_path):
             outputs1 = model1(volume_batch)
             outputs_soft1 = torch.softmax(outputs1, dim=1)
 
-            outputs2 = model2(volume_batch)
-            outputs_soft2 = torch.softmax(outputs2, dim=1)
+            # outputs2 = model2(volume_batch)
+            # outputs_soft2 = torch.softmax(outputs2, dim=1)
+            with torch.no_grad():
+                mask_generator = SamAutomaticMaskGenerator(model2)
+                outputs2 = torch.zeros([16,4,224,224])
+                for i in range(volume_batch.shape[0]):
+                    sam_image = volume_batch.repeat(1,3,1,1)[i].permute(1,2,0)
+                    tmp = mask_generator.generate(sam_image)
+                    plt.figure(figsize=(20, 20))
+                    plt.imshow(sam_image)
+                    show_anns(tmp)
+                    plt.axis('off')
+                    plt.show()
+                    tmp2 = tmp2
+            # with torch.no_grad():
+            #     bounding_boxes = []
+            #     for i in range(label_batch.size(0)):
+            #         image_tensor = label_batch[i]
+            #         bbox = find_bounding_box_from_tensor(image_tensor)
+            #         bounding_boxes.append(bbox)
+            #     bounding_boxes = torch.Tensor(bounding_boxes)
+            #     sparse_embeddings, dense_embeddings = model2.prompt_encoder(
+            #         points=None,
+            #         boxes=bounding_boxes,
+            #         masks=None,
+            #     )
+            #     image_embedding = model2.image_encoder(nn.Upsample(scale_factor=4, mode='bilinear')(volume_batch.repeat(1, 3, 1, 1)))
+            #     low_res_masks, iou_predictions = model2.mask_decoder(
+            #         image_embeddings=image_embedding,
+            #         image_pe=model2.prompt_encoder.get_dense_pe(),
+            #         sparse_prompt_embeddings=sparse_embeddings,
+            #         dense_prompt_embeddings=dense_embeddings,
+            #         multimask_output=False,
+            #     )
+            #     upscaled_masks = model2.postprocess_masks(low_res_masks, 1024, 256)
+            #     outputs2 = normalize(threshold(upscaled_masks, 0.0, 0))
+
+
             consistency_weight = get_current_consistency_weight(
                 iter_num // 150)
 

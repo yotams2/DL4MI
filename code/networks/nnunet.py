@@ -526,7 +526,7 @@ def initialize_network(threeD=True, num_classes=2):
         default_dict["net_num_pool_op_kernel_sizes"], default_dict["net_conv_kernel_sizes"], False, True, True)
     print("nnUNet have {} paramerters in total".format(
         sum(x.numel() for x in network.parameters())))
-    return network.cuda()
+    return network#.cuda()
 
 # input = torch.FloatTensor(1, 1, 32, 192, 192)
 # input_var = input.cuda()
