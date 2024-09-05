@@ -29,9 +29,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter
-from torch.nn.modules.loss import CrossEntropyLoss
+from torch.nn.modules.loss import CrossEntropyLoss, NLLLoss, MSELoss
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.ops import sigmoid_focal_loss
 from tqdm import tqdm
 
 from config import get_config
@@ -84,6 +85,8 @@ parser.add_argument('--use-checkpoint', action='store_true',
                     help="whether to use gradient checkpointing to save memory")
 parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
                     help='mixed precision opt level, if O0, no amp is used')
+parser.add_argument('--loss', type=str, default='wce', choices=['ce_and_dice', 'nll', 'wce'],
+                    help='loss function to use for the labeled data training')
 parser.add_argument('--tag', help='tag of experiment')
 parser.add_argument('--eval', action='store_true',
                     help='Perform evaluation only')
@@ -202,6 +205,18 @@ def train(args, snapshot_path):
                            momentum=0.9, weight_decay=0.0001)
     optimizer2 = optim.SGD(model2.parameters(), lr=base_lr,
                            momentum=0.9, weight_decay=0.0001)
+
+    if args.loss == 'wce':
+        weights_calc_batches = 0
+        class_weights = np.zeros(4)
+        for i_batch, sampled_batch in enumerate(trainloader):
+            volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
+            class_weights += np.array(torch.bincount(torch.flatten(label_batch)))
+            weights_calc_batches += 1
+        class_weights /= (weights_calc_batches * torch.flatten(label_batch).shape[0])
+        wce_loss = CrossEntropyLoss(weight=torch.from_numpy(class_weights).to(torch.float32))
+
+    nll_loss = NLLLoss()
     ce_loss = CrossEntropyLoss()
     dice_loss = losses.DiceLoss(num_classes)
 
@@ -227,10 +242,17 @@ def train(args, snapshot_path):
             consistency_weight = get_current_consistency_weight(
                 iter_num // 150)
 
-            loss1 = 0.5 * (ce_loss(outputs1[:args.labeled_bs], label_batch[:args.labeled_bs].long()) + dice_loss(
-                outputs_soft1[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1)))
-            loss2 = 0.5 * (ce_loss(outputs2[:args.labeled_bs], label_batch[:args.labeled_bs].long()) + dice_loss(
-                outputs_soft2[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1)))
+            if args.loss == 'ce_and_dice':
+                loss1 = 0.5 * (ce_loss(outputs1[:args.labeled_bs], label_batch[:args.labeled_bs].long()) + dice_loss(
+                    outputs_soft1[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1)))
+                loss2 = 0.5 * (ce_loss(outputs2[:args.labeled_bs], label_batch[:args.labeled_bs].long()) + dice_loss(
+                    outputs_soft2[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1)))
+            elif args.loss == 'nll':
+                loss1 = nll_loss(outputs1[:args.labeled_bs], label_batch[:args.labeled_bs].long())
+                loss2 = nll_loss(outputs2[:args.labeled_bs], label_batch[:args.labeled_bs].long())
+            elif args.loss == 'wce':
+                loss1 = wce_loss(outputs1[:args.labeled_bs], label_batch[:args.labeled_bs].long())
+                loss2 = wce_loss(outputs2[:args.labeled_bs], label_batch[:args.labeled_bs].long())
 
             pseudo_outputs1 = torch.argmax(
                 outputs_soft1[args.labeled_bs:].detach(), dim=1, keepdim=False)
@@ -286,7 +308,7 @@ def train(args, snapshot_path):
                 labs = label_batch[1, ...].unsqueeze(0) * 50
                 writer.add_image('train/GroundTruth', labs, iter_num)
 
-            if iter_num > 0 and iter_num % 10 == 0:
+            if iter_num > 0 and iter_num % 10 == 0: # FIXME revert to 200
                 model1.eval()
                 metric_list = 0.0
                 for i_batch, sampled_batch in enumerate(valloader):
@@ -390,8 +412,8 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     # torch.cuda.manual_seed(args.seed)
 
-    snapshot_path = "../model/{}_{}/{}".format(
-        args.exp, args.labeled_num, args.model)
+    snapshot_path = "../different_losses/{}_{}/{}".format(
+        args.exp, args.labeled_num, args.loss)
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     if os.path.exists(snapshot_path + '/code'):

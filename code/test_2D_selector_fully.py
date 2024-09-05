@@ -11,6 +11,8 @@ from medpy import metric
 from scipy.ndimage import zoom
 from scipy.ndimage.interpolation import zoom
 from tqdm import tqdm
+import torch.nn as nn
+from torchvision.models import resnet18, ResNet18_Weights, resnet34, ResNet34_Weights
 
 # from networks.efficientunet import UNet
 from networks.net_factory import net_factory
@@ -18,12 +20,18 @@ from networks.net_factory import net_factory
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='../data/ACDC', help='Name of Experiment')
-parser.add_argument('--model_path', type=str,
-                    default='../model/ACDC/Cross_Teaching_Between_CNN_Transformer_7/best_overall_models/unet_best_model2.pth', help='path to model .pth file')
+parser.add_argument('--model1_weights', type=str,
+                    default='../model/ACDC/Cross_Teaching_Between_CNN_Transformer_7/best_overall_models/unet_best_model1.pth', help='path to model1 .pth file')
+parser.add_argument('--model2_weights', type=str,
+                    default='../model/ACDC/Cross_Teaching_Between_CNN_Transformer_7/best_overall_models/unet_best_model2.pth', help='path to model2 .pth file')
+parser.add_argument('--selector_weights', type=str,
+                    default='../selector/ACDC/Cross_Teaching_Between_CNN_Transformer_7/resnet34_from_server/resnet34/selector_best.pth', help='path to model .pth file')
 parser.add_argument('--exp', type=str,
                     default='ACDC/Fully_Supervised', help='experiment_name')
 parser.add_argument('--model', type=str,
                     default='unet', help='model_name')
+parser.add_argument('--selector_model', choices=['resnet18', 'resnet34'], type=str,
+                    default='resnet34', help='model_name')
 parser.add_argument('--num_classes', type=int,  default=4,
                     help='output channel of network')
 parser.add_argument('--labeled_num', type=int, default=3,
@@ -81,37 +89,58 @@ def calculate_metric_percase(pred, gt):
     pred[pred > 0] = 1
     gt[gt > 0] = 1
     dice = metric.binary.dc(pred, gt)
-    try:
-        asd = metric.binary.asd(pred, gt)
-        hd95 = metric.binary.hd95(pred, gt)
-    except:
-        asd = None
-        hd95 = None
+    asd = metric.binary.asd(pred, gt)
+    hd95 = metric.binary.hd95(pred, gt)
     return dice, hd95, asd
 
 
-def test_single_volume(case, net, test_save_path, FLAGS):
+def test_single_volume(case, model1, model2, selector, test_save_path, FLAGS):
     h5f = h5py.File(FLAGS.root_path + "/data/{}.h5".format(case), 'r')
     image = h5f['image'][:]
     label = h5f['label'][:]
-    prediction = np.zeros_like(label)
+    prediction  = np.zeros_like(label)
+    prediction1 = np.zeros_like(label)
+    prediction2 = np.zeros_like(label)
+    num_selected_model1 = 0
+    total_num = 0
     for ind in range(image.shape[0]):
         slice = image[ind, :, :]
         x, y = slice.shape[0], slice.shape[1]
         slice = zoom(slice, (FLAGS.patch_size[0] / x, FLAGS.patch_size[1] / y), order=0)
         input = torch.from_numpy(slice).unsqueeze(
             0).unsqueeze(0).float()#.cuda()
-        net.eval()
         with torch.no_grad():
-            if FLAGS.model == "unet_urds":
-                out_main, _, _, _ = net(input)
+            initial_output = selector(input.repeat(1, 3, 1, 1))
+            selector_pred = torch.argmax(torch.softmax(initial_output, dim=1), dim=1)
+            total_num += 1
+            out_main1 = model1(input)
+            out_main2 = model2(input)
+
+            out1 = torch.argmax(torch.softmax(
+                out_main1, dim=1), dim=1).squeeze(0)
+            out1 = out1.cpu().detach().numpy()
+            pred1 = zoom(out1, (x / FLAGS.patch_size[0], y / FLAGS.patch_size[1]), order=0)
+            prediction1[ind] = pred1
+
+            out2 = torch.argmax(torch.softmax(
+                out_main2, dim=1), dim=1).squeeze(0)
+            out2 = out2.cpu().detach().numpy()
+            pred2 = zoom(out2, (x / FLAGS.patch_size[0], y / FLAGS.patch_size[1]), order=0)
+            prediction2[ind] = pred2
+
+            if selector_pred == 0:
+                num_selected_model1 += 1
+                prediction[ind] = pred1
             else:
-                out_main = net(input)
-            out = torch.argmax(torch.softmax(
-                out_main, dim=1), dim=1).squeeze(0)
-            out = out.cpu().detach().numpy()
-            pred = zoom(out, (x / FLAGS.patch_size[0], y / FLAGS.patch_size[1]), order=0)
-            prediction[ind] = pred
+                prediction[ind] = pred2
+
+    first_metric1 = calculate_metric_percase(prediction1 == 1, label == 1)
+    second_metric1 = calculate_metric_percase(prediction1 == 2, label == 2)
+    third_metric1 = calculate_metric_percase(prediction1 == 3, label == 3)
+
+    first_metric2 = calculate_metric_percase(prediction2 == 1, label == 1)
+    second_metric2 = calculate_metric_percase(prediction2 == 2, label == 2)
+    third_metric2 = calculate_metric_percase(prediction2 == 3, label == 3)
 
     first_metric = calculate_metric_percase(prediction == 1, label == 1)
     second_metric = calculate_metric_percase(prediction == 2, label == 2)
@@ -126,7 +155,7 @@ def test_single_volume(case, net, test_save_path, FLAGS):
     sitk.WriteImage(prd_itk, test_save_path + case + "_pred.nii.gz")
     sitk.WriteImage(img_itk, test_save_path + case + "_img.nii.gz")
     sitk.WriteImage(lab_itk, test_save_path + case + "_gt.nii.gz")
-    return first_metric, second_metric, third_metric
+    return first_metric, second_metric, third_metric, num_selected_model1, total_num
 
 
 def Inference(FLAGS):
@@ -134,47 +163,73 @@ def Inference(FLAGS):
         image_list = f.readlines()
     image_list = sorted([item.replace('\n', '').split(".")[0]
                          for item in image_list])
-    if FLAGS.model_path != "":
-        snapshot_path = FLAGS.model_path
-        snapshot_path_dir, _ = os.path.splitext(snapshot_path)
-        test_save_path = snapshot_path_dir + "_predictions/"
-        model_path = FLAGS.model_path
-        save_mode_path = snapshot_path
-    else:
-        snapshot_path = "../model/{}_{}_labeled/{}".format(
-            FLAGS.exp, FLAGS.labeled_num, FLAGS.model)
-        test_save_path = "../model/{}_{}_labeled/{}_predictions/".format(
-            FLAGS.exp, FLAGS.labeled_num, FLAGS.model)
-        model_path = '{}_best_model.pth'.format(FLAGS.model)
-        save_mode_path = os.path.join(
-            snapshot_path, model_path)
+
+    test_save_path = os.path.splitext(FLAGS.selector_weights)[0] + "_predictions/selector/"
+    save_mode_path1 = FLAGS.model1_weights
+    save_mode_path2 = FLAGS.model2_weights
+
     if os.path.exists(test_save_path):
         shutil.rmtree(test_save_path)
     os.makedirs(test_save_path)
-    if 'swin_unet.patch_embed.proj.weight' in torch.load(save_mode_path).keys():
-        FLAGS.model = "ViT_Seg"
-    net = net_factory(net_type=FLAGS.model, in_chns=1,
-                      class_num=FLAGS.num_classes)
 
-    net.load_state_dict(torch.load(save_mode_path))
-    print("init weight from {}".format(save_mode_path))
-    net.eval()
+    model1 = net_factory(net_type=FLAGS.model, in_chns=1,
+                      class_num=FLAGS.num_classes)
+    FLAGS2 = FLAGS
+    FLAGS2.model = "ViT_Seg"
+    model2 = net_factory(net_type=FLAGS2.model, in_chns=1,
+                      class_num=FLAGS2.num_classes)
+
+    model1.load_state_dict(torch.load(save_mode_path1))
+    print("init weight for model1 from {}".format(save_mode_path1))
+    model1.eval()
+
+    model2.load_state_dict(torch.load(save_mode_path2))
+    print("init weight for model2 from {}".format(save_mode_path2))
+    model2.eval()
+
+    if FLAGS.selector_model == "resnet18":
+        selector = resnet18(weights=ResNet18_Weights.DEFAULT)
+        selector.fc = nn.Sequential(
+              nn.Linear(512, 256),
+              nn.ReLU(),
+              nn.Linear(256, 128),
+              nn.ReLU(),
+              nn.Linear(128, 64),
+              nn.ReLU(),
+              nn.Linear(64, 2)
+            )
+    elif FLAGS.selector_model == "resnet34":
+        selector = resnet34(weights=ResNet34_Weights.DEFAULT)
+        selector.fc = nn.Sequential(
+              nn.Linear(512, 256),
+              nn.ReLU(),
+              # nn.BatchNorm1d(256),
+              nn.Linear(256, 128),
+              nn.ReLU(),
+              nn.Linear(128, 64),
+              nn.ReLU(),
+              nn.Linear(64, 2)
+            )
+    selector.load_state_dict(torch.load(FLAGS.selector_weights))
+    print("init weight for selector from {}".format(FLAGS.selector_weights))
+    selector.eval()
 
     first_total = 0.0
     second_total = 0.0
     third_total = 0.0
-    denominator = len(image_list)
+    num_selected_model1 = 0
+    total_num = 0
     for case in tqdm(image_list):
-        first_metric, second_metric, third_metric = test_single_volume(
-            case, net, test_save_path, FLAGS)
-        try:
-            first_total += np.asarray(first_metric)
-            second_total += np.asarray(second_metric)
-            third_total += np.asarray(third_metric)
-        except:
-            denominator -= 1
-    avg_metric = [first_total / denominator, second_total /
-                  denominator, third_total / denominator]
+        first_metric, second_metric, third_metric, num_selected_model1_i, total_num_i = test_single_volume(
+            case, model1, model2, selector, test_save_path, FLAGS)
+        first_total += np.asarray(first_metric)
+        second_total += np.asarray(second_metric)
+        third_total += np.asarray(third_metric)
+        num_selected_model1 += num_selected_model1_i
+        total_num += total_num_i
+    print(f"Selected model1: {num_selected_model1}/{total_num}")
+    avg_metric = [first_total / len(image_list), second_total /
+                  len(image_list), third_total / len(image_list)]
     return avg_metric
 
 

@@ -15,7 +15,7 @@ def calculate_metric_percase(pred, gt):
         return 0, 0
 
 
-def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
+def test_single_volume(image, label, net, classes, patch_size=[256, 256], selector_version=False):
     image, label = image.squeeze(0).cpu().detach(
     ).numpy(), label.squeeze(0).cpu().detach().numpy()
     prediction = np.zeros_like(label)
@@ -32,11 +32,21 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
             out = out.cpu().detach().numpy()
             pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
             prediction[ind] = pred
-    metric_list = []
-    for i in range(1, classes):
-        metric_list.append(calculate_metric_percase(
-            prediction == i, label == i))
-    return metric_list
+    if selector_version:
+        metric_tensor = []
+        for slice_idx in range(image.shape[0]):
+            metric_list_i = []
+            for class_idx in range(1, classes):
+                metric_list_i.append(calculate_metric_percase(
+                    prediction[slice_idx] == class_idx, label[slice_idx] == class_idx))
+            metric_tensor.append(metric_list_i)
+        return metric_tensor
+    else:
+        metric_list = []
+        for i in range(1, classes):
+            metric_list.append(calculate_metric_percase(
+                prediction == i, label == i))
+        return metric_list
 
 
 def test_single_volume_ds(image, label, net, classes, patch_size=[256, 256]):
